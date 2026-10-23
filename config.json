@@ -2,6 +2,16 @@
   "log": {
     "level": "warn"
   },
+  "dns": {
+    "servers": [
+      {
+        "type": "tls",
+        "tag": "cf-dns",
+        "server": "1.1.1.1"
+      }
+    ],
+    "strategy": "prefer_ipv6"
+  },
   "endpoints": [
     {
       "type": "wireguard",
@@ -337,6 +347,7 @@
     }
   ],
   "route": {
+    "default_domain_resolver": "cf-dns",
     "rules": [
       {
         "inbound": "socks-1",

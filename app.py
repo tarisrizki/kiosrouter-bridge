@@ -46,12 +46,17 @@ async def diag():
     port_ips = {}
     for p in range(40001, 40013):
         try:
-            proc = subprocess.run(
-                ["curl", "-m", "2", "-s", "--socks5", f"127.0.0.1:{p}", "https://cloudflare.com/cdn-cgi/trace"],
+            proc4 = subprocess.run(
+                ["curl", "-m", "2", "-s", "-4", "--socks5", f"127.0.0.1:{p}", "https://cloudflare.com/cdn-cgi/trace"],
                 capture_output=True, text=True, timeout=3
             )
-            ip_line = [l for l in proc.stdout.splitlines() if l.startswith("ip=")]
-            port_ips[p] = ip_line[0] if ip_line else (f"ERR {proc.returncode}" if proc.returncode != 0 else "no_ip")
+            ip4 = [l for l in proc4.stdout.splitlines() if l.startswith("ip=")]
+            proc6 = subprocess.run(
+                ["curl", "-m", "2", "-s", "-6", "--socks5", f"127.0.0.1:{p}", "https://cloudflare.com/cdn-cgi/trace"],
+                capture_output=True, text=True, timeout=3
+            )
+            ip6 = [l for l in proc6.stdout.splitlines() if l.startswith("ip=")]
+            port_ips[p] = {"ipv4": ip4[0] if ip4 else "none", "ipv6": ip6[0] if ip6 else "none"}
         except Exception as e:
             port_ips[p] = str(e)
 
@@ -60,6 +65,17 @@ async def diag():
         "balancer_log": tail_file("balancer.log"),
         "router_log": tail_file("9router.log")
     }
+
+def make_fresh_session() -> str:
+    import time, random, string
+    current = int(time.time() * 1000) * 0x1000 + 1
+    val = (~current) & ((1 << 48) - 1)
+    b = bytearray(6)
+    for i in range(6):
+        b[i] = (val >> (40 - 8*i)) & 0xff
+    chars = string.ascii_letters + string.digits
+    rand_suffix = ''.join(random.choice(chars) for _ in range(14))
+    return f"ses_{b.hex()}{rand_suffix}"
 
 def normalize_model(model_name: str) -> str:
     clean = model_name.strip()
@@ -89,11 +105,15 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
         body["model"] = normalize_model(body["model"])
 
     is_stream = body.get("stream", False)
+    incoming_session = request.headers.get("x-session-id") or request.headers.get("session-id") or make_fresh_session()
 
     forward_headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {INTERNAL_KEY}",
-        "Accept": "application/json, text/event-stream" if is_stream else "application/json"
+        "Accept": "application/json, text/event-stream" if is_stream else "application/json",
+        "x-session-id": incoming_session,
+        "session-id": incoming_session,
+        "x-claude-code-session-id": incoming_session
     }
 
     # 3. Dispatch to local 9router-go (which uses sing-box 12-WARP pool)

@@ -23,6 +23,28 @@ python3 balancer.py > balancer.log 2>&1 &
 BAL_PID=$!
 sleep 1
 
+# Reset stale locks in sqlite3
+python3 -c "
+import sqlite3, json
+try:
+    con = sqlite3.connect('data/data.sqlite3')
+    cur = con.cursor()
+    row = cur.execute('SELECT data FROM providerConnections WHERE id=\"7931c4bc-e3cb-42d5-b244-2acc79a195bd\"').fetchone()
+    if row:
+        data = json.loads(row[0])
+        data['rateLimitedUntil'] = None
+        data['lastError'] = None
+        data['status'] = 'active'
+        data['backoffLevel'] = 0
+        for k in list(data.keys()):
+            if k.startswith('modelLock_'):
+                data[k] = None
+        cur.execute('UPDATE providerConnections SET data = ? WHERE id=\"7931c4bc-e3cb-42d5-b244-2acc79a195bd\"', (json.dumps(data),))
+        con.commit()
+except Exception as e:
+    print('Reset warning:', e)
+"
+
 # 4. Launch 9router-go AI gateway on :20130
 echo "🛡️ [KiosanBridge] Starting 9router-go gateway on :20130..."
 DATA_DIR="./data" \
