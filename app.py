@@ -118,27 +118,43 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
 
     # 3. Dispatch to local 9router-go (which uses sing-box 12-WARP pool)
     if is_stream:
-        async def stream_generator():
+        try:
+            req_obj = http_client.build_request("POST", TARGET_9ROUTER_URL, json=body, headers=forward_headers, timeout=120.0)
+            resp = await http_client.send(req_obj, stream=True)
+            if resp.status_code != 200:
+                err_body = await resp.aread()
+                await resp.aclose()
+                return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
+
+            aiter = resp.aiter_bytes()
             try:
-                async with http_client.stream(
-                    "POST",
-                    TARGET_9ROUTER_URL,
-                    json=body,
-                    headers=forward_headers,
-                    timeout=120.0
-                ) as resp:
-                    async for chunk in resp.aiter_bytes():
+                first_chunk = await anext(aiter)
+            except StopAsyncIteration:
+                await resp.aclose()
+                return Response(content=b'{"error":{"message":"empty stream","type":"server_error"}}', status_code=502, media_type="application/json")
+
+            if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk:
+                rest = await resp.aread()
+                await resp.aclose()
+                return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
+
+            async def stream_generator():
+                try:
+                    yield first_chunk
+                    async for chunk in aiter:
                         if chunk:
                             yield chunk
-            except Exception as e:
-                err_payload = json.dumps({"error": {"message": f"Bridge stream error: {str(e)}", "type": "upstream_error"}})
-                yield f"data: {err_payload}\n\ndata: [DONE]\n\n".encode("utf-8")
+                finally:
+                    await resp.aclose()
 
-        return StreamingResponse(
-            stream_generator(),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
-        )
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+            )
+        except Exception as e:
+            err_json = json.dumps({"error": {"message": f"Bridge error: {str(e)}", "type": "server_error"}}).encode("utf-8")
+            return Response(content=err_json, status_code=502, media_type="application/json")
     else:
         # Non-streaming request with automatic single retry on 429
         last_resp = None
