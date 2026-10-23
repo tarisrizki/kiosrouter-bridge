@@ -33,6 +33,44 @@ def health():
         "timestamp": "ok"
     }
 
+@app.get("/diag")
+async def diag():
+    import subprocess
+    def tail_file(fpath):
+        try:
+            with open(fpath) as f:
+                return f.readlines()[-40:]
+        except Exception as e:
+            return [str(e)]
+
+    socks_probe = "not run"
+    try:
+        proc = subprocess.run(
+            ["curl", "-m", "4", "-s", "--socks5", "127.0.0.1:40001", "https://cloudflare.com/cdn-cgi/trace"],
+            capture_output=True, text=True, timeout=5
+        )
+        socks_probe = proc.stdout if proc.returncode == 0 else f"ERR code {proc.returncode}: {proc.stderr}"
+    except Exception as e:
+        socks_probe = str(e)
+
+    router_probe = "not run"
+    try:
+        proc = subprocess.run(
+            ["curl", "-m", "4", "-s", "http://127.0.0.1:20130/models"],
+            capture_output=True, text=True, timeout=5
+        )
+        router_probe = proc.stdout[:200] if proc.returncode == 0 else f"ERR: {proc.stderr}"
+    except Exception as e:
+        router_probe = str(e)
+
+    return {
+        "singbox_log": tail_file("singbox.log"),
+        "balancer_log": tail_file("balancer.log"),
+        "router_log": tail_file("9router.log"),
+        "socks_probe_40001": socks_probe,
+        "router_probe_20130": router_probe
+    }
+
 def normalize_model(model_name: str) -> str:
     clean = model_name.strip()
     if clean.startswith("oc/"):
