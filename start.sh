@@ -40,6 +40,7 @@ try:
             if k.startswith('modelLock_'):
                 data[k] = None
         cur.execute('UPDATE providerConnections SET data = ? WHERE id=\"7931c4bc-e3cb-42d5-b244-2acc79a195bd\"', (json.dumps(data),))
+        cur.execute('UPDATE proxyPools SET data = ? WHERE id=\"warp-socks5\"', (json.dumps({'name':'WARP SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'}),))
         con.commit()
 except Exception as e:
     print('Reset warning:', e)
