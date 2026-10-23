@@ -2,21 +2,28 @@ import os
 import json
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from curl_cffi import requests
+import httpx
 import uvicorn
 
 app = FastAPI(title="KiosanRouter Egress Bridge")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
+TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "http://127.0.0.1:20130/v1/chat/completions")
+INTERNAL_KEY = "sk-internal-heroku-bridge"
 
-OPENCODE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
+# Shared async HTTP client for high concurrency
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
 
 @app.get("/")
 def index():
     return {
         "status": "online",
-        "service": "kiosrouter-egress-bridge",
-        "version": "1.0.0",
-        "engine": "curl_cffi_chrome124_utls"
+        "service": "kiosan-bridge",
+        "pool": "12-warp-nodes",
+        "version": "2.0.0"
     }
 
 @app.get("/health")
@@ -25,6 +32,16 @@ def health():
         "status": "healthy",
         "timestamp": "ok"
     }
+
+def normalize_model(model_name: str) -> str:
+    clean = model_name.strip()
+    if clean.startswith("oc/"):
+        base = clean[3:]
+    else:
+        base = clean
+    if not base.endswith("-free"):
+        base = f"{base}-free"
+    return f"oc/{base}"
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, x_bridge_secret: str = Header(None)):
@@ -40,30 +57,31 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
 
     # 2. Parse request body
     body = await request.json()
-    body["anonymous"] = True
-
     if "model" in body and isinstance(body["model"], str):
-        clean_model = body["model"].rstrip("-free")
-        body["model"] = f"{clean_model}-free"
+        body["model"] = normalize_model(body["model"])
 
     is_stream = body.get("stream", False)
 
-    headers = {
+    forward_headers = {
         "Content-Type": "application/json",
-        "User-Agent": "opencode/1.19.4",
-        "x-opencode-client": "cli",
-        "Accept": "application/json, text/event-stream"
+        "Authorization": f"Bearer {INTERNAL_KEY}",
+        "Accept": "application/json, text/event-stream" if is_stream else "application/json"
     }
 
-    # 3. Dispatch with Chrome 124 stealth TLS fingerprint (bypasses Cloudflare WAF)
+    # 3. Dispatch to local 9router-go (which uses sing-box 12-WARP pool)
     if is_stream:
-        def stream_generator():
+        async def stream_generator():
             try:
-                with requests.Session(impersonate="chrome124") as s:
-                    with s.post(OPENCODE_URL, json=body, headers=headers, stream=True, timeout=120) as resp:
-                        for chunk in resp.iter_content(chunk_size=1024):
-                            if chunk:
-                                yield chunk
+                async with http_client.stream(
+                    "POST",
+                    TARGET_9ROUTER_URL,
+                    json=body,
+                    headers=forward_headers,
+                    timeout=120.0
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            yield chunk
             except Exception as e:
                 err_payload = json.dumps({"error": {"message": f"Bridge stream error: {str(e)}", "type": "upstream_error"}})
                 yield f"data: {err_payload}\n\ndata: [DONE]\n\n".encode("utf-8")
@@ -74,20 +92,61 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
         )
     else:
-        try:
-            with requests.Session(impersonate="chrome124") as s:
-                resp = s.post(OPENCODE_URL, json=body, headers=headers, timeout=120)
+        # Non-streaming request with automatic single retry on 429
+        last_resp = None
+        for attempt in range(2):
+            try:
+                resp = await http_client.post(
+                    TARGET_9ROUTER_URL,
+                    json=body,
+                    headers=forward_headers,
+                    timeout=120.0
+                )
+                last_resp = resp
+                if resp.status_code == 429 and attempt == 0:
+                    # Rate limit encountered on this node, retry instantly to hit next node in pool
+                    continue
+                
+                # Format usage for Strix AI / Pydantic compatibility
+                content = resp.content
+                if resp.status_code == 200:
+                    try:
+                        data = json.loads(content)
+                        if "usage" in data and isinstance(data["usage"], dict):
+                            u = data["usage"]
+                            p = u.get("prompt_tokens", 0)
+                            c = u.get("completion_tokens", 0)
+                            if "total_tokens" not in u:
+                                u["total_tokens"] = p + c
+                            content = json.dumps(data).encode("utf-8")
+                    except Exception:
+                        pass
+
                 return Response(
-                    content=resp.content,
+                    content=content,
                     status_code=resp.status_code,
                     media_type="application/json"
                 )
-        except Exception as e:
+            except Exception as e:
+                if attempt == 1:
+                    return Response(
+                        content=json.dumps({"error": {"message": f"Bridge dispatch error: {str(e)}", "type": "upstream_error"}}),
+                        status_code=502,
+                        media_type="application/json"
+                    )
+
+        if last_resp is not None:
             return Response(
-                content=json.dumps({"error": {"message": f"Bridge dispatch error: {str(e)}", "type": "upstream_error"}}),
-                status_code=502,
+                content=last_resp.content,
+                status_code=last_resp.status_code,
                 media_type="application/json"
             )
+
+        return Response(
+            content=json.dumps({"error": {"message": "All bridge retry attempts exhausted", "type": "upstream_error"}}),
+            status_code=502,
+            media_type="application/json"
+        )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
