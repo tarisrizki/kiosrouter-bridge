@@ -1,5 +1,7 @@
 import os
 import json
+import sqlite3
+import asyncio
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
@@ -10,8 +12,61 @@ BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
 TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "http://127.0.0.1:20130/v1/chat/completions")
 INTERNAL_KEY = "sk-internal-heroku-bridge"
 
+# Concurrency tracker per user key
+ACTIVE_CONCURRENCY: dict[str, int] = {}
+CONCURRENCY_LIMIT = 4
+
+def get_user_identifier(request: Request) -> str:
+    user_key = request.headers.get("x-user-key")
+    if user_key and user_key.strip():
+        return user_key.strip()
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token and token != BRIDGE_SECRET:
+            return token
+    return request.client.host if request.client else "anonymous"
+
+def reset_9router_locks():
+    try:
+        con = sqlite3.connect("data/data.sqlite3")
+        cur = con.cursor()
+        row = cur.execute('SELECT data FROM providerConnections WHERE id="7931c4bc-e3cb-42d5-b244-2acc79a195bd"').fetchone()
+        if row:
+            d = json.loads(row[0])
+            needs_update = False
+            if d.get("rateLimitedUntil") is not None or d.get("status") != "active" or d.get("backoffLevel", 0) > 0:
+                d["rateLimitedUntil"] = None
+                d["status"] = "active"
+                d["backoffLevel"] = 0
+                needs_update = True
+            for k in list(d.keys()):
+                if k.startswith("modelLock_") and d[k] is not None:
+                    d[k] = None
+                    needs_update = True
+            if needs_update:
+                cur.execute('UPDATE providerConnections SET data = ? WHERE id="7931c4bc-e3cb-42d5-b244-2acc79a195bd"', (json.dumps(d),))
+                cur.execute('UPDATE proxyPools SET data = ? WHERE id="warp-socks5"', (json.dumps({'name':'WARP SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'}),))
+                con.commit()
+        con.close()
+    except Exception:
+        pass
+
+async def periodic_lock_cleaner():
+    while True:
+        try:
+            reset_9router_locks()
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+
 # Shared async HTTP client for high concurrency
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+
+@app.on_event("startup")
+async def startup_event():
+    reset_9router_locks()
+    asyncio.create_task(periodic_lock_cleaner())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -62,6 +117,7 @@ async def diag():
 
     return {
         "port_ips": port_ips,
+        "active_concurrency": ACTIVE_CONCURRENCY,
         "balancer_log": tail_file("balancer.log"),
         "router_log": tail_file("9router.log")
     }
@@ -99,8 +155,30 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
             detail={"error": {"message": "Unauthorized: invalid bridge secret", "type": "authentication_error"}}
         )
 
-    # 2. Parse request body
-    body = await request.json()
+    # 2. Concurrency Control (Max 4 active requests per user key)
+    user_id = get_user_identifier(request)
+    current_active = ACTIVE_CONCURRENCY.get(user_id, 0)
+    if current_active >= CONCURRENCY_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": "Maksimal 4 request berjalan bersamaan per key. Tunggu request sebelumnya selesai.",
+                    "type": "rate_limit_error"
+                }
+            }
+        )
+    ACTIVE_CONCURRENCY[user_id] = current_active + 1
+
+    # 3. Parse request body
+    try:
+        body = await request.json()
+    except Exception:
+        ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+        if ACTIVE_CONCURRENCY.get(user_id) == 0:
+            ACTIVE_CONCURRENCY.pop(user_id, None)
+        raise HTTPException(status_code=400, detail={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
+
     if "model" in body and isinstance(body["model"], str):
         body["model"] = normalize_model(body["model"])
 
@@ -116,7 +194,7 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
         "x-claude-code-session-id": incoming_session
     }
 
-    # 3. Dispatch to local 9router-go (which uses sing-box 12-WARP pool)
+    # 4. Dispatch to local 9router-go (which uses sing-box 12-WARP pool)
     if is_stream:
         try:
             req_obj = http_client.build_request("POST", TARGET_9ROUTER_URL, json=body, headers=forward_headers, timeout=120.0)
@@ -124,6 +202,11 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
             if resp.status_code != 200:
                 err_body = await resp.aread()
                 await resp.aclose()
+                ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                    ACTIVE_CONCURRENCY.pop(user_id, None)
+                if resp.status_code == 429:
+                    reset_9router_locks()
                 return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
 
             aiter = resp.aiter_bytes()
@@ -131,11 +214,18 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                 first_chunk = await anext(aiter)
             except StopAsyncIteration:
                 await resp.aclose()
+                ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                    ACTIVE_CONCURRENCY.pop(user_id, None)
                 return Response(content=b'{"error":{"message":"empty stream","type":"server_error"}}', status_code=502, media_type="application/json")
 
             if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk:
                 rest = await resp.aread()
                 await resp.aclose()
+                ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                    ACTIVE_CONCURRENCY.pop(user_id, None)
+                reset_9router_locks()
                 return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
 
             async def stream_generator():
@@ -146,6 +236,9 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                             yield chunk
                 finally:
                     await resp.aclose()
+                    ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                    if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                        ACTIVE_CONCURRENCY.pop(user_id, None)
 
             return StreamingResponse(
                 stream_generator(),
@@ -153,64 +246,73 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
             )
         except Exception as e:
+            ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+            if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                ACTIVE_CONCURRENCY.pop(user_id, None)
             err_json = json.dumps({"error": {"message": f"Bridge error: {str(e)}", "type": "server_error"}}).encode("utf-8")
             return Response(content=err_json, status_code=502, media_type="application/json")
     else:
         # Non-streaming request with automatic single retry on 429
-        last_resp = None
-        for attempt in range(2):
-            try:
-                resp = await http_client.post(
-                    TARGET_9ROUTER_URL,
-                    json=body,
-                    headers=forward_headers,
-                    timeout=120.0
-                )
-                last_resp = resp
-                if resp.status_code == 429 and attempt == 0:
-                    # Rate limit encountered on this node, retry instantly to hit next node in pool
-                    continue
-                
-                # Format usage for Strix AI / Pydantic compatibility
-                content = resp.content
-                if resp.status_code == 200:
-                    try:
-                        data = json.loads(content)
-                        if "usage" in data and isinstance(data["usage"], dict):
-                            u = data["usage"]
-                            p = u.get("prompt_tokens", 0)
-                            c = u.get("completion_tokens", 0)
-                            if "total_tokens" not in u:
-                                u["total_tokens"] = p + c
-                            content = json.dumps(data).encode("utf-8")
-                    except Exception:
-                        pass
+        try:
+            last_resp = None
+            for attempt in range(2):
+                try:
+                    resp = await http_client.post(
+                        TARGET_9ROUTER_URL,
+                        json=body,
+                        headers=forward_headers,
+                        timeout=120.0
+                    )
+                    last_resp = resp
+                    if resp.status_code == 429:
+                        reset_9router_locks()
+                        if attempt == 0:
+                            continue
+                    
+                    # Format usage for Strix AI / Pydantic compatibility
+                    content = resp.content
+                    if resp.status_code == 200:
+                        try:
+                            data = json.loads(content)
+                            if "usage" in data and isinstance(data["usage"], dict):
+                                u = data["usage"]
+                                p = u.get("prompt_tokens", 0)
+                                c = u.get("completion_tokens", 0)
+                                if "total_tokens" not in u:
+                                    u["total_tokens"] = p + c
+                                content = json.dumps(data).encode("utf-8")
+                        except Exception:
+                            pass
 
-                return Response(
-                    content=content,
-                    status_code=resp.status_code,
-                    media_type="application/json"
-                )
-            except Exception as e:
-                if attempt == 1:
                     return Response(
-                        content=json.dumps({"error": {"message": f"Bridge dispatch error: {str(e)}", "type": "upstream_error"}}),
-                        status_code=502,
+                        content=content,
+                        status_code=resp.status_code,
                         media_type="application/json"
                     )
+                except Exception as e:
+                    if attempt == 1:
+                        return Response(
+                            content=json.dumps({"error": {"message": f"Bridge dispatch error: {str(e)}", "type": "upstream_error"}}),
+                            status_code=502,
+                            media_type="application/json"
+                        )
 
-        if last_resp is not None:
+            if last_resp is not None:
+                return Response(
+                    content=last_resp.content,
+                    status_code=last_resp.status_code,
+                    media_type="application/json"
+                )
+
             return Response(
-                content=last_resp.content,
-                status_code=last_resp.status_code,
+                content=json.dumps({"error": {"message": "All bridge retry attempts exhausted", "type": "upstream_error"}}),
+                status_code=502,
                 media_type="application/json"
             )
-
-        return Response(
-            content=json.dumps({"error": {"message": "All bridge retry attempts exhausted", "type": "upstream_error"}}),
-            status_code=502,
-            media_type="application/json"
-        )
+        finally:
+            ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+            if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                ACTIVE_CONCURRENCY.pop(user_id, None)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
