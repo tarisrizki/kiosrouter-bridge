@@ -1,42 +1,104 @@
 import os
 import json
+import time
+import string
+import random
 import asyncio
+import logging
+from typing import Optional, Dict
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
+# Configuration
 TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "https://bridge.kiosan.my.id/v1/chat/completions")
 INTERNAL_KEY = os.environ.get("INTERNAL_KEY", "sk-c19dd0561af14824929e649640cce72d")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
 SILICONFLOW_KEY = os.environ.get("SILICONFLOW_KEY", "")
+CONCURRENCY_LIMIT = int(os.environ.get("CONCURRENCY_LIMIT", "4"))
+RETRY_DELAY_MIN = float(os.environ.get("RETRY_DELAY_MIN", "1.5"))
+RETRY_DELAY_MAX = float(os.environ.get("RETRY_DELAY_MAX", "2.0"))
 
-# Concurrency tracker per user key
-ACTIVE_CONCURRENCY: dict[str, int] = {}
-CONCURRENCY_LIMIT = 4
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("kiosan-bridge")
 
-app = FastAPI(title="kiosan-bridge", version="3.0.0")
+# Thread/Task-safe Concurrency Tracker per User Key
+class ConcurrencyTracker:
+    def __init__(self, limit: int = 4, counts: Optional[Dict[str, int]] = None):
+        self.limit = limit
+        self._lock = asyncio.Lock()
+        self._counts = counts if counts is not None else {}
 
-# Shared async HTTP client for high concurrency
-http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+    async def acquire(self, key: str) -> bool:
+        async with self._lock:
+            current = self._counts.get(key, 0)
+            if current >= self.limit:
+                return False
+            self._counts[key] = current + 1
+            return True
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await http_client.aclose()
+    async def release(self, key: str):
+        async with self._lock:
+            if key in self._counts:
+                self._counts[key] -= 1
+                if self._counts[key] <= 0:
+                    self._counts.pop(key, None)
+
+    async def get_active(self) -> Dict[str, int]:
+        async with self._lock:
+            return dict(self._counts)
+
+    async def total_active(self) -> int:
+        async with self._lock:
+            return sum(self._counts.values())
+
+    async def user_active(self, key: str) -> int:
+        async with self._lock:
+            return self._counts.get(key, 0)
+
+# Shared in-memory concurrency storage
+ACTIVE_CONCURRENCY: Dict[str, int] = {}
+tracker = ConcurrencyTracker(limit=CONCURRENCY_LIMIT, counts=ACTIVE_CONCURRENCY)
+
+# Shared async HTTP client pool tuned for high concurrency
+CLIENT_LIMITS = httpx.Limits(
+    max_connections=1000,
+    max_keepalive_connections=100,
+    keepalive_expiry=30.0
+)
+CLIENT_TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
+
+http_client = httpx.AsyncClient(limits=CLIENT_LIMITS, timeout=CLIENT_TIMEOUT)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    if http_client is None or http_client.is_closed:
+        http_client = httpx.AsyncClient(limits=CLIENT_LIMITS, timeout=CLIENT_TIMEOUT)
+    yield
+    if http_client and not http_client.is_closed:
+        await http_client.aclose()
+
+app = FastAPI(title="kiosan-bridge", version="3.1.0", lifespan=lifespan)
 
 def get_user_identifier(request: Request) -> str:
     user_key = request.headers.get("x-user-key")
     if user_key and user_key.strip():
         return user_key.strip()
+    api_key = request.headers.get("x-api-key")
+    if api_key and api_key.strip():
+        return api_key.strip()
     auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer "):
+    if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
         if token and token != BRIDGE_SECRET and token != INTERNAL_KEY:
             return token
     return request.client.host if request.client else "anonymous"
 
 def make_fresh_session() -> str:
-    import time, random, string
     current = int(time.time() * 1000) * 0x1000 + 1
     val = (~current) & ((1 << 48) - 1)
     b = bytearray(6)
@@ -56,32 +118,51 @@ def normalize_model(model_name: str) -> str:
         base = f"{base}-free"
     return f"oc/{base}"
 
+async def wait_retry_delay():
+    delay = random.uniform(RETRY_DELAY_MIN, RETRY_DELAY_MAX)
+    logger.info(f"Retrying upstream dispatch after {delay:.2f}s...")
+    await asyncio.sleep(delay)
+
+def build_forward_headers(is_stream: bool, session_id: Optional[str] = None) -> dict:
+    session = session_id or make_fresh_session()
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {INTERNAL_KEY}",
+        "Accept": "application/json, text/event-stream" if is_stream else "application/json",
+        "x-session-id": session,
+        "session-id": session,
+        "x-claude-code-session-id": session
+    }
+
 @app.get("/")
-def index():
+async def index():
+    active_map = await tracker.get_active()
     return {
         "status": "online",
         "service": "kiosan-bridge",
         "architecture": "3-tier-edge-buffer",
         "target": TARGET_9ROUTER_URL,
         "concurrency_limit_per_user": CONCURRENCY_LIMIT,
-        "active_users": len(ACTIVE_CONCURRENCY),
-        "total_active_requests": sum(ACTIVE_CONCURRENCY.values()),
-        "version": "3.0.0"
+        "active_users": len(active_map),
+        "total_active_requests": sum(active_map.values()),
+        "version": "3.1.0"
     }
 
 @app.get("/health")
-def health():
+async def health():
+    total_active = await tracker.total_active()
     return {
         "status": "healthy",
         "service": "kiosan-bridge",
-        "active_connections": sum(ACTIVE_CONCURRENCY.values()),
+        "active_connections": total_active,
         "timestamp": "ok"
     }
 
 @app.get("/diag")
 async def diag():
+    active_map = await tracker.get_active()
     return {
-        "active_concurrency": ACTIVE_CONCURRENCY,
+        "active_concurrency": active_map,
         "target_url": TARGET_9ROUTER_URL,
         "has_siliconflow_fallback": bool(SILICONFLOW_KEY)
     }
@@ -100,7 +181,8 @@ async def list_models():
     }
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, x_bridge_secret: str = Header(None)):
+@app.post("/chat/completions")
+async def chat_completions(request: Request, x_bridge_secret: Optional[str] = Header(None)):
     # 1. Validate Bridge Secret if configured
     auth_header = request.headers.get("Authorization", "")
     incoming_secret = x_bridge_secret or (auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else "")
@@ -113,8 +195,8 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
 
     # 2. Concurrency Control (Max 4 active requests per user key)
     user_id = get_user_identifier(request)
-    current_active = ACTIVE_CONCURRENCY.get(user_id, 0)
-    if current_active >= CONCURRENCY_LIMIT:
+    acquired = await tracker.acquire(user_id)
+    if not acquired:
         raise HTTPException(
             status_code=429,
             detail={
@@ -124,60 +206,103 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                 }
             }
         )
-    ACTIVE_CONCURRENCY[user_id] = current_active + 1
+
+    # Slot release responsibility: True = released in handler finally; False = handed to stream generator
+    slot_held_by_route = True
 
     try:
         try:
             body = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}}
+            )
 
-        raw_model = body.get("model", "")
         if "model" in body and isinstance(body["model"], str):
             body["model"] = normalize_model(body["model"])
 
-        is_stream = body.get("stream", False)
-        incoming_session = request.headers.get("x-session-id") or request.headers.get("session-id") or make_fresh_session()
+        is_stream = bool(body.get("stream", False))
+        incoming_session = request.headers.get("x-session-id") or request.headers.get("session-id")
 
-        forward_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {INTERNAL_KEY}",
-            "Accept": "application/json, text/event-stream" if is_stream else "application/json",
-            "x-session-id": incoming_session,
-            "session-id": incoming_session,
-            "x-claude-code-session-id": incoming_session
-        }
-
-        # 3. Dispatch to Proxmox Cluster (via Cloudflare Tunnel)
+        # 3. Dispatch with Transparent Single Retry on 429, 502, 503, 504, or network fault
         if is_stream:
-            # Streaming request with 1 automatic retry on 429
             for attempt in range(2):
-                req_obj = http_client.build_request("POST", TARGET_9ROUTER_URL, json=body, headers=forward_headers, timeout=120.0)
-                resp = await http_client.send(req_obj, stream=True)
-                if resp.status_code != 200:
+                session_to_use = incoming_session if (incoming_session and attempt == 0) else make_fresh_session()
+                forward_headers = build_forward_headers(is_stream=True, session_id=session_to_use)
+                req_obj = http_client.build_request(
+                    "POST",
+                    TARGET_9ROUTER_URL,
+                    json=body,
+                    headers=forward_headers,
+                    timeout=CLIENT_TIMEOUT
+                )
+
+                try:
+                    resp = await http_client.send(req_obj, stream=True)
+                except (httpx.RequestError, httpx.HTTPError) as exc:
+                    logger.warning(f"Streaming attempt {attempt} failed with network error: {exc}")
+                    if attempt == 0:
+                        await wait_retry_delay()
+                        continue
+                    return Response(
+                        content=json.dumps({"error": {"message": f"Bridge upstream network error: {str(exc)}", "type": "upstream_error"}}).encode("utf-8"),
+                        status_code=502,
+                        media_type="application/json"
+                    )
+
+                if resp.status_code in (429, 502, 503, 504):
                     err_body = await resp.aread()
                     await resp.aclose()
-                    if resp.status_code == 429 and attempt == 0:
-                        await asyncio.sleep(1.0)
+                    logger.warning(f"Streaming attempt {attempt} received upstream status {resp.status_code}")
+                    if attempt == 0:
+                        await wait_retry_delay()
                         continue
                     return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
 
+                if resp.status_code != 200:
+                    err_body = await resp.aread()
+                    await resp.aclose()
+                    return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
+
+                # Peek first chunk for disguised errors or empty stream
                 aiter = resp.aiter_bytes()
                 try:
                     first_chunk = await anext(aiter)
                 except StopAsyncIteration:
                     await resp.aclose()
+                    logger.warning(f"Streaming attempt {attempt} received empty stream")
                     if attempt == 0:
+                        await wait_retry_delay()
                         continue
-                    return Response(content=b'{"error":{"message":"empty stream","type":"server_error"}}', status_code=502, media_type="application/json")
+                    return Response(
+                        content=b'{"error":{"message":"Empty stream from upstream backend","type":"upstream_error"}}',
+                        status_code=502,
+                        media_type="application/json"
+                    )
+                except Exception as exc:
+                    await resp.aclose()
+                    logger.warning(f"Streaming attempt {attempt} read error: {exc}")
+                    if attempt == 0:
+                        await wait_retry_delay()
+                        continue
+                    return Response(
+                        content=json.dumps({"error": {"message": f"Stream read error: {str(exc)}", "type": "upstream_error"}}).encode("utf-8"),
+                        status_code=502,
+                        media_type="application/json"
+                    )
 
-                if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk:
+                if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk or b"rate_limit_exceeded" in first_chunk:
                     rest = await resp.aread()
                     await resp.aclose()
+                    logger.warning(f"Streaming attempt {attempt} detected disguised rate limit error")
                     if attempt == 0:
-                        await asyncio.sleep(1.0)
+                        await wait_retry_delay()
                         continue
                     return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
+
+                # Successful stream initialization: transfer slot ownership to stream generator
+                slot_held_by_route = False
 
                 async def stream_generator():
                     try:
@@ -187,72 +312,80 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                                 yield chunk
                     finally:
                         await resp.aclose()
+                        await tracker.release(user_id)
 
                 return StreamingResponse(
                     stream_generator(),
                     media_type="text/event-stream",
-                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+                    headers={
+                        "X-Accel-Buffering": "no",
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive"
+                    }
                 )
+
         else:
-            # Non-streaming request
-            last_resp = None
+            # Non-streaming request with transparent retry
             for attempt in range(2):
+                session_to_use = incoming_session if (incoming_session and attempt == 0) else make_fresh_session()
+                forward_headers = build_forward_headers(is_stream=False, session_id=session_to_use)
+
                 try:
                     resp = await http_client.post(
                         TARGET_9ROUTER_URL,
                         json=body,
                         headers=forward_headers,
-                        timeout=120.0
+                        timeout=CLIENT_TIMEOUT
                     )
-                    last_resp = resp
-                    if resp.status_code == 429 and attempt == 0:
-                        await asyncio.sleep(1.0)
+                except (httpx.RequestError, httpx.HTTPError) as exc:
+                    logger.warning(f"Non-streaming attempt {attempt} failed with network error: {exc}")
+                    if attempt == 0:
+                        await wait_retry_delay()
                         continue
-
-                    content = resp.content
-                    if resp.status_code == 200:
-                        try:
-                            data = json.loads(content)
-                            if "usage" in data and isinstance(data["usage"], dict):
-                                u = data["usage"]
-                                p = u.get("prompt_tokens", 0)
-                                c = u.get("completion_tokens", 0)
-                                if "total_tokens" not in u:
-                                    u["total_tokens"] = p + c
-                                content = json.dumps(data).encode("utf-8")
-                        except Exception:
-                            pass
-
                     return Response(
-                        content=content,
-                        status_code=resp.status_code,
+                        content=json.dumps({"error": {"message": f"Bridge upstream network error: {str(exc)}", "type": "upstream_error"}}).encode("utf-8"),
+                        status_code=502,
                         media_type="application/json"
                     )
-                except Exception as e:
-                    if attempt == 1:
-                        return Response(
-                            content=json.dumps({"error": {"message": f"Bridge dispatch error: {str(e)}", "type": "upstream_error"}}),
-                            status_code=502,
-                            media_type="application/json"
-                        )
 
-            if last_resp is not None:
-                return Response(
-                    content=last_resp.content,
-                    status_code=last_resp.status_code,
-                    media_type="application/json"
-                )
+                content = resp.content
 
-            return Response(
-                content=json.dumps({"error": {"message": "All bridge retry attempts exhausted", "type": "upstream_error"}}),
-                status_code=502,
-                media_type="application/json"
-            )
+                if resp.status_code in (429, 502, 503, 504):
+                    logger.warning(f"Non-streaming attempt {attempt} received upstream status {resp.status_code}")
+                    if attempt == 0:
+                        await wait_retry_delay()
+                        continue
+                    return Response(content=content, status_code=resp.status_code, media_type="application/json")
+
+                if resp.status_code == 200:
+                    if b"FreeTierError" in content or b"FreeUsageLimitError" in content or b"rate_limit_exceeded" in content:
+                        logger.warning(f"Non-streaming attempt {attempt} detected disguised rate limit error")
+                        if attempt == 0:
+                            await wait_retry_delay()
+                            continue
+                        return Response(content=content, status_code=429, media_type="application/json")
+
+                    # Standardize usage statistics for Pydantic / OpenAI clients
+                    try:
+                        data = json.loads(content)
+                        if isinstance(data, dict) and "usage" in data and isinstance(data["usage"], dict):
+                            u = data["usage"]
+                            p = u.get("prompt_tokens", 0)
+                            c = u.get("completion_tokens", 0)
+                            if "total_tokens" not in u:
+                                u["total_tokens"] = p + c
+                            content = json.dumps(data).encode("utf-8")
+                    except Exception:
+                        pass
+
+                    return Response(content=content, status_code=200, media_type="application/json")
+
+                # Any other non-retryable response (e.g. 400 Bad Request, 401 Unauthorized)
+                return Response(content=content, status_code=resp.status_code, media_type="application/json")
 
     finally:
-        ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-        if ACTIVE_CONCURRENCY.get(user_id) == 0:
-            ACTIVE_CONCURRENCY.pop(user_id, None)
+        if slot_held_by_route:
+            await tracker.release(user_id)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
