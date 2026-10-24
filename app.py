@@ -1,23 +1,28 @@
 import os
 import json
-import sqlite3
 import asyncio
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
-import balancer
-import harvester
-
-app = FastAPI(title="KiosanRouter Egress Bridge")
+TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "https://bridge.kiosan.my.id/v1/chat/completions")
+INTERNAL_KEY = os.environ.get("INTERNAL_KEY", "sk-c19dd0561af14824929e649640cce72d")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
-TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "http://127.0.0.1:20130/v1/chat/completions")
-INTERNAL_KEY = "sk-internal-heroku-bridge"
+SILICONFLOW_KEY = os.environ.get("SILICONFLOW_KEY", "")
 
 # Concurrency tracker per user key
 ACTIVE_CONCURRENCY: dict[str, int] = {}
 CONCURRENCY_LIMIT = 4
+
+app = FastAPI(title="kiosan-bridge", version="3.0.0")
+
+# Shared async HTTP client for high concurrency
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
 
 def get_user_identifier(request: Request) -> str:
     user_key = request.headers.get("x-user-key")
@@ -26,82 +31,9 @@ def get_user_identifier(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
-        if token and token != BRIDGE_SECRET:
+        if token and token != BRIDGE_SECRET and token != INTERNAL_KEY:
             return token
     return request.client.host if request.client else "anonymous"
-
-def reset_9router_locks():
-    try:
-        con = sqlite3.connect("data/data.sqlite3")
-        cur = con.cursor()
-        row = cur.execute('SELECT data FROM providerConnections WHERE id="7931c4bc-e3cb-42d5-b244-2acc79a195bd"').fetchone()
-        if row:
-            d = json.loads(row[0])
-            needs_update = False
-            if d.get("rateLimitedUntil") is not None or d.get("status") != "active" or d.get("backoffLevel", 0) > 0:
-                d["rateLimitedUntil"] = None
-                d["status"] = "active"
-                d["backoffLevel"] = 0
-                needs_update = True
-            for k in list(d.keys()):
-                if k.startswith("modelLock_") and d[k] is not None:
-                    d[k] = None
-                    needs_update = True
-            if needs_update:
-                cur.execute('UPDATE providerConnections SET data = ?, priority = 100, isActive = 1 WHERE id="7931c4bc-e3cb-42d5-b244-2acc79a195bd"', (json.dumps(d),))
-                cur.execute('UPDATE proxyPools SET data = ? WHERE id="warp-socks5"', (json.dumps({'name':'Main SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'}),))
-                con.commit()
-        con.close()
-    except Exception:
-        pass
-
-async def periodic_lock_cleaner():
-    while True:
-        try:
-            reset_9router_locks()
-        except Exception:
-            pass
-        await asyncio.sleep(2.0)
-
-# Shared async HTTP client for high concurrency
-http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
-
-@app.on_event("startup")
-async def startup_event():
-    reset_9router_locks()
-    await balancer.start_balancer()
-    asyncio.create_task(harvester.harvester_daemon(active_concurrency_getter=lambda: sum(ACTIVE_CONCURRENCY.values())))
-    asyncio.create_task(periodic_lock_cleaner())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await http_client.aclose()
-
-@app.get("/")
-def index():
-    return {
-        "status": "online",
-        "service": "kiosan-bridge",
-        "pool": "mnet-quota-verified-pool",
-        "active_proxies": len(balancer.ACTIVE_PROXIES),
-        "version": "3.0.0"
-    }
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "active_proxies": len(balancer.ACTIVE_PROXIES),
-        "timestamp": "ok"
-    }
-
-@app.get("/diag")
-async def diag():
-    return {
-        "pool_status": balancer.get_pool_status(),
-        "harvester_telemetry": harvester.get_harvester_status(),
-        "active_concurrency": ACTIVE_CONCURRENCY
-    }
 
 def make_fresh_session() -> str:
     import time, random, string
@@ -124,9 +56,52 @@ def normalize_model(model_name: str) -> str:
         base = f"{base}-free"
     return f"oc/{base}"
 
+@app.get("/")
+def index():
+    return {
+        "status": "online",
+        "service": "kiosan-bridge",
+        "architecture": "3-tier-edge-buffer",
+        "target": TARGET_9ROUTER_URL,
+        "concurrency_limit_per_user": CONCURRENCY_LIMIT,
+        "active_users": len(ACTIVE_CONCURRENCY),
+        "total_active_requests": sum(ACTIVE_CONCURRENCY.values()),
+        "version": "3.0.0"
+    }
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "service": "kiosan-bridge",
+        "active_connections": sum(ACTIVE_CONCURRENCY.values()),
+        "timestamp": "ok"
+    }
+
+@app.get("/diag")
+async def diag():
+    return {
+        "active_concurrency": ACTIVE_CONCURRENCY,
+        "target_url": TARGET_9ROUTER_URL,
+        "has_siliconflow_fallback": bool(SILICONFLOW_KEY)
+    }
+
+@app.get("/v1/models")
+async def list_models():
+    # Canonical verified free models
+    return {
+        "object": "list",
+        "data": [
+            {"id": "deepseek-v4.1-flash-free", "object": "model", "owned_by": "opencode"},
+            {"id": "glm-5.3-flash-free", "object": "model", "owned_by": "opencode"},
+            {"id": "mimo-v2.6-flash-free", "object": "model", "owned_by": "opencode"},
+            {"id": "nemotron-3.5-super-vl-free", "object": "model", "owned_by": "opencode"}
+        ]
+    }
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, x_bridge_secret: str = Header(None)):
-    # 1. Validate Secret if configured
+    # 1. Validate Bridge Secret if configured
     auth_header = request.headers.get("Authorization", "")
     incoming_secret = x_bridge_secret or (auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else "")
 
@@ -144,55 +119,47 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
             status_code=429,
             detail={
                 "error": {
-                    "message": "Maksimal 4 request berjalan bersamaan per key. Tunggu request sebelumnya selesai.",
+                    "message": f"Maksimal {CONCURRENCY_LIMIT} request berjalan bersamaan per key. Tunggu request sebelumnya selesai.",
                     "type": "rate_limit_error"
                 }
             }
         )
     ACTIVE_CONCURRENCY[user_id] = current_active + 1
 
-    # 3. Parse request body
     try:
-        body = await request.json()
-    except Exception:
-        ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-        if ACTIVE_CONCURRENCY.get(user_id) == 0:
-            ACTIVE_CONCURRENCY.pop(user_id, None)
-        raise HTTPException(status_code=400, detail={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
-
-    if "model" in body and isinstance(body["model"], str):
-        body["model"] = normalize_model(body["model"])
-
-    is_stream = body.get("stream", False)
-    incoming_session = request.headers.get("x-session-id") or request.headers.get("session-id") or make_fresh_session()
-
-    forward_headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {INTERNAL_KEY}",
-        "Accept": "application/json, text/event-stream" if is_stream else "application/json",
-        "x-session-id": incoming_session,
-        "session-id": incoming_session,
-        "x-claude-code-session-id": incoming_session
-    }
-
-    # 4. Dispatch to local 9router-go (which uses balancer rotating pool)
-    if is_stream:
         try:
-            # Attempt with 1 automatic retry on 429
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
+
+        raw_model = body.get("model", "")
+        if "model" in body and isinstance(body["model"], str):
+            body["model"] = normalize_model(body["model"])
+
+        is_stream = body.get("stream", False)
+        incoming_session = request.headers.get("x-session-id") or request.headers.get("session-id") or make_fresh_session()
+
+        forward_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {INTERNAL_KEY}",
+            "Accept": "application/json, text/event-stream" if is_stream else "application/json",
+            "x-session-id": incoming_session,
+            "session-id": incoming_session,
+            "x-claude-code-session-id": incoming_session
+        }
+
+        # 3. Dispatch to Proxmox Cluster (via Cloudflare Tunnel)
+        if is_stream:
+            # Streaming request with 1 automatic retry on 429
             for attempt in range(2):
                 req_obj = http_client.build_request("POST", TARGET_9ROUTER_URL, json=body, headers=forward_headers, timeout=120.0)
                 resp = await http_client.send(req_obj, stream=True)
                 if resp.status_code != 200:
                     err_body = await resp.aread()
                     await resp.aclose()
-                    if resp.status_code == 429:
-                        reset_9router_locks()
-                        if attempt == 0:
-                            await asyncio.sleep(0.5)
-                            continue
-                    ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                    if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                        ACTIVE_CONCURRENCY.pop(user_id, None)
+                    if resp.status_code == 429 and attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
                     return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
 
                 aiter = resp.aiter_bytes()
@@ -202,21 +169,14 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                     await resp.aclose()
                     if attempt == 0:
                         continue
-                    ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                    if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                        ACTIVE_CONCURRENCY.pop(user_id, None)
                     return Response(content=b'{"error":{"message":"empty stream","type":"server_error"}}', status_code=502, media_type="application/json")
 
                 if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk:
                     rest = await resp.aread()
                     await resp.aclose()
-                    reset_9router_locks()
                     if attempt == 0:
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1.0)
                         continue
-                    ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                    if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                        ACTIVE_CONCURRENCY.pop(user_id, None)
                     return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
 
                 async def stream_generator():
@@ -227,24 +187,14 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                                 yield chunk
                     finally:
                         await resp.aclose()
-                        ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                        if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                            ACTIVE_CONCURRENCY.pop(user_id, None)
 
                 return StreamingResponse(
                     stream_generator(),
                     media_type="text/event-stream",
                     headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
                 )
-        except Exception as e:
-            ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-            if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                ACTIVE_CONCURRENCY.pop(user_id, None)
-            err_json = json.dumps({"error": {"message": f"Bridge error: {str(e)}", "type": "server_error"}}).encode("utf-8")
-            return Response(content=err_json, status_code=502, media_type="application/json")
-    else:
-        # Non-streaming request with automatic single retry on 429
-        try:
+        else:
+            # Non-streaming request
             last_resp = None
             for attempt in range(2):
                 try:
@@ -255,13 +205,10 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                         timeout=120.0
                     )
                     last_resp = resp
-                    if resp.status_code == 429:
-                        reset_9router_locks()
-                        if attempt == 0:
-                            await asyncio.sleep(0.5)
-                            continue
-                    
-                    # Format usage for Strix AI / Pydantic compatibility
+                    if resp.status_code == 429 and attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+
                     content = resp.content
                     if resp.status_code == 200:
                         try:
@@ -301,10 +248,11 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                 status_code=502,
                 media_type="application/json"
             )
-        finally:
-            ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-            if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                ACTIVE_CONCURRENCY.pop(user_id, None)
+
+    finally:
+        ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+        if ACTIVE_CONCURRENCY.get(user_id) == 0:
+            ACTIVE_CONCURRENCY.pop(user_id, None)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
