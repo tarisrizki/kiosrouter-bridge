@@ -12,7 +12,7 @@ INTERNAL_KEY = "sk-internal-heroku-bridge"
 
 TARGET_POOL_SIZE = int(os.environ.get("TARGET_POOL_SIZE", "35"))
 MAX_CONCURRENT_WORKERS = int(os.environ.get("HARVESTER_CONCURRENCY", "12"))
-PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "2.5"))
+PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "4.0"))
 
 SOURCES = [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=3000&country=all",
@@ -22,6 +22,23 @@ SOURCES = [
 ]
 
 is_scanning = False
+TOTAL_PROBED = 0
+TOTAL_200 = 0
+TOTAL_429 = 0
+TOTAL_403 = 0
+TOTAL_TIMEOUT = 0
+RECENT_PROBES: list[dict] = []
+
+def get_harvester_status():
+    return {
+        "is_scanning": is_scanning,
+        "total_probed": TOTAL_PROBED,
+        "total_200": TOTAL_200,
+        "total_429": TOTAL_429,
+        "total_403": TOTAL_403,
+        "total_timeout": TOTAL_TIMEOUT,
+        "recent_probes": RECENT_PROBES[-10:]
+    }
 
 async def fetch_candidate_batch(batch_size=100) -> list[tuple[str, int]]:
     candidates = set()
@@ -50,8 +67,12 @@ async def fetch_candidate_batch(batch_size=100) -> list[tuple[str, int]]:
     return list(candidates)
 
 async def test_candidate(host: str, port: int, probe_lock: asyncio.Lock, http_client: httpx.AsyncClient) -> bool:
+    global TOTAL_PROBED, TOTAL_200, TOTAL_429, TOTAL_403, TOTAL_TIMEOUT
     async with probe_lock:
+        TOTAL_PROBED += 1
         balancer.set_probe_target(host, port)
+        status = None
+        detail = ""
         try:
             req_body = {
                 "model": "oc/deepseek-v4.1-flash-free",
@@ -70,12 +91,28 @@ async def test_candidate(host: str, port: int, probe_lock: asyncio.Lock, http_cl
                 headers=headers,
                 timeout=PROBE_TIMEOUT
             )
-            if resp.status_code == 200:
+            status = resp.status_code
+            detail = resp.text[:120]
+            if status == 200:
+                TOTAL_200 += 1
                 logger.info(f"🎯 [Harvester] Verified Zen Quota Active: {host}:{port}")
                 balancer.add_proxy(host, port)
+                RECENT_PROBES.append({"proxy": f"{host}:{port}", "status": 200, "result": "quota_active"})
                 return True
-        except Exception:
-            pass
+            elif status == 429:
+                TOTAL_429 += 1
+                RECENT_PROBES.append({"proxy": f"{host}:{port}", "status": 429, "result": "quota_exhausted"})
+            elif status == 403:
+                TOTAL_403 += 1
+                RECENT_PROBES.append({"proxy": f"{host}:{port}", "status": 403, "result": "waf_blocked"})
+            else:
+                RECENT_PROBES.append({"proxy": f"{host}:{port}", "status": status, "result": detail})
+        except Exception as e:
+            TOTAL_TIMEOUT += 1
+            RECENT_PROBES.append({"proxy": f"{host}:{port}", "status": "timeout", "result": str(e)[:60]})
+        
+        if len(RECENT_PROBES) > 50:
+            RECENT_PROBES.pop(0)
         return False
 
 async def run_harvester_cycle(active_concurrency_getter=None):
@@ -96,7 +133,7 @@ async def run_harvester_cycle(active_concurrency_getter=None):
             return
 
         probe_lock = asyncio.Lock()
-        async with httpx.AsyncClient(timeout=10.0) as http_client:
+        async with httpx.AsyncClient(timeout=12.0) as http_client:
             for host, port in candidates:
                 # 1. User priority guardrail: if real users are active, pause scanning
                 if active_concurrency_getter:
@@ -117,7 +154,6 @@ async def run_harvester_cycle(active_concurrency_getter=None):
 
 async def harvester_daemon(active_concurrency_getter=None):
     logger.info("🌾 [Harvester] Background proxy harvester daemon started")
-    # Initial quick burst
     await asyncio.sleep(3.0)
     while True:
         try:
@@ -125,7 +161,6 @@ async def harvester_daemon(active_concurrency_getter=None):
             if current_count < TARGET_POOL_SIZE:
                 await run_harvester_cycle(active_concurrency_getter)
             else:
-                # Pool is healthy, sleep 30s before keeping fresh
                 await asyncio.sleep(30.0)
         except Exception as e:
             logger.error(f"Harvester cycle error: {e}")

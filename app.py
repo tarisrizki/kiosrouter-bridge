@@ -99,8 +99,8 @@ def health():
 async def diag():
     return {
         "pool_status": balancer.get_pool_status(),
-        "active_concurrency": ACTIVE_CONCURRENCY,
-        "is_scanning": harvester.is_scanning
+        "harvester_telemetry": harvester.get_harvester_status(),
+        "active_concurrency": ACTIVE_CONCURRENCY
     }
 
 def make_fresh_session() -> str:
