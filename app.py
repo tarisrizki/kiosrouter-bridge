@@ -4,6 +4,7 @@ import time
 import string
 import random
 import asyncio
+import hmac
 import logging
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
@@ -21,6 +22,8 @@ SILICONFLOW_KEY = os.environ.get("SILICONFLOW_KEY", "")
 CONCURRENCY_LIMIT = int(os.environ.get("CONCURRENCY_LIMIT", "4"))
 RETRY_DELAY_MIN = float(os.environ.get("RETRY_DELAY_MIN", "1.5"))
 RETRY_DELAY_MAX = float(os.environ.get("RETRY_DELAY_MAX", "2.0"))
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("kiosan-bridge")
@@ -59,6 +62,32 @@ class ConcurrencyTracker:
         async with self._lock:
             return self._counts.get(key, 0)
 
+# Idempotent lease handle to guarantee single release under all conditions
+class SlotLease:
+    def __init__(self, tracker: ConcurrencyTracker, key: str):
+        self.tracker = tracker
+        self.key = key
+        self.released = False
+        self._lock = asyncio.Lock()
+
+    async def release(self):
+        async with self._lock:
+            if not self.released:
+                self.released = True
+                await self.tracker.release(self.key)
+
+# StreamingResponse subclass ensuring body iterator is explicitly closed on client disconnect
+class SafeStreamingResponse(StreamingResponse):
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            if hasattr(self.body_iterator, "aclose"):
+                try:
+                    await self.body_iterator.aclose()
+                except Exception:
+                    pass
+
 # Shared in-memory concurrency storage
 ACTIVE_CONCURRENCY: Dict[str, int] = {}
 tracker = ConcurrencyTracker(limit=CONCURRENCY_LIMIT, counts=ACTIVE_CONCURRENCY)
@@ -82,7 +111,7 @@ async def lifespan(app: FastAPI):
     if http_client and not http_client.is_closed:
         await http_client.aclose()
 
-app = FastAPI(title="kiosan-bridge", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="kiosan-bridge", version="3.2.0", lifespan=lifespan)
 
 def get_user_identifier(request: Request) -> str:
     user_key = request.headers.get("x-user-key")
@@ -96,6 +125,9 @@ def get_user_identifier(request: Request) -> str:
         token = auth[7:].strip()
         if token and token != BRIDGE_SECRET and token != INTERNAL_KEY:
             return token
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded and forwarded.strip():
+        return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "anonymous"
 
 def make_fresh_session() -> str:
@@ -145,7 +177,7 @@ async def index():
         "concurrency_limit_per_user": CONCURRENCY_LIMIT,
         "active_users": len(active_map),
         "total_active_requests": sum(active_map.values()),
-        "version": "3.1.0"
+        "version": "3.2.0"
     }
 
 @app.get("/health")
@@ -184,14 +216,14 @@ async def list_models():
 @app.post("/chat/completions")
 async def chat_completions(request: Request, x_bridge_secret: Optional[str] = Header(None)):
     # 1. Validate Bridge Secret if configured
-    auth_header = request.headers.get("Authorization", "")
-    incoming_secret = x_bridge_secret or (auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else "")
-
-    if BRIDGE_SECRET and incoming_secret != BRIDGE_SECRET:
-        raise HTTPException(
-            status_code=401,
-            detail={"error": {"message": "Unauthorized: invalid bridge secret", "type": "authentication_error"}}
-        )
+    if BRIDGE_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        incoming_secret = x_bridge_secret or (auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else "")
+        if not incoming_secret or not hmac.compare_digest(incoming_secret, BRIDGE_SECRET):
+            raise HTTPException(
+                status_code=401,
+                detail={"error": {"message": "Unauthorized: invalid bridge secret", "type": "authentication_error"}}
+            )
 
     # 2. Concurrency Control (Max 4 active requests per user key)
     user_id = get_user_identifier(request)
@@ -207,6 +239,7 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
             }
         )
 
+    lease = SlotLease(tracker, user_id)
     # Slot release responsibility: True = released in handler finally; False = handed to stream generator
     slot_held_by_route = True
 
@@ -225,7 +258,7 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
         is_stream = bool(body.get("stream", False))
         incoming_session = request.headers.get("x-session-id") or request.headers.get("session-id")
 
-        # 3. Dispatch with Transparent Single Retry on 429, 502, 503, 504, or network fault
+        # 3. Dispatch with Transparent Single Retry on 429, 502, 503, 504, 52x or network fault
         if is_stream:
             for attempt in range(2):
                 session_to_use = incoming_session if (incoming_session and attempt == 0) else make_fresh_session()
@@ -251,7 +284,7 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
                         media_type="application/json"
                     )
 
-                if resp.status_code in (429, 502, 503, 504):
+                if resp.status_code in RETRYABLE_STATUS_CODES:
                     err_body = await resp.aread()
                     await resp.aclose()
                     logger.warning(f"Streaming attempt {attempt} received upstream status {resp.status_code}")
@@ -264,6 +297,25 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
                     err_body = await resp.aread()
                     await resp.aclose()
                     return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
+
+                # If status is 200, check content type
+                content_type = resp.headers.get("content-type", "").lower()
+                if "application/json" in content_type:
+                    # Upstream returned a non-streamed JSON (e.g. disguised error)
+                    json_body = await resp.aread()
+                    await resp.aclose()
+                    is_disguised_limit = (
+                        b"FreeTierError" in json_body
+                        or b"FreeUsageLimitError" in json_body
+                        or b"rate_limit_exceeded" in json_body
+                    )
+                    if is_disguised_limit:
+                        logger.warning(f"Streaming attempt {attempt} detected disguised rate limit JSON")
+                        if attempt == 0:
+                            await wait_retry_delay()
+                            continue
+                        return Response(content=json_body, status_code=429, media_type="application/json")
+                    return Response(content=json_body, status_code=200, media_type="application/json")
 
                 # Peek first chunk for disguised errors or empty stream
                 aiter = resp.aiter_bytes()
@@ -293,13 +345,19 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
                     )
 
                 if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk or b"rate_limit_exceeded" in first_chunk:
-                    rest = await resp.aread()
+                    rest_chunks = []
+                    try:
+                        async for chunk in aiter:
+                            rest_chunks.append(chunk)
+                    except Exception:
+                        pass
                     await resp.aclose()
-                    logger.warning(f"Streaming attempt {attempt} detected disguised rate limit error")
+                    full_err = first_chunk + b"".join(rest_chunks)
+                    logger.warning(f"Streaming attempt {attempt} detected disguised rate limit in stream")
                     if attempt == 0:
                         await wait_retry_delay()
                         continue
-                    return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
+                    return Response(content=full_err, status_code=429, media_type="application/json")
 
                 # Successful stream initialization: transfer slot ownership to stream generator
                 slot_held_by_route = False
@@ -310,11 +368,13 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
                         async for chunk in aiter:
                             if chunk:
                                 yield chunk
+                    except (httpx.RequestError, httpx.HTTPError, asyncio.CancelledError) as exc:
+                        logger.warning(f"Stream interrupted for user {user_id}: {exc}")
                     finally:
                         await resp.aclose()
-                        await tracker.release(user_id)
+                        await lease.release()
 
-                return StreamingResponse(
+                return SafeStreamingResponse(
                     stream_generator(),
                     media_type="text/event-stream",
                     headers={
@@ -350,7 +410,7 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
 
                 content = resp.content
 
-                if resp.status_code in (429, 502, 503, 504):
+                if resp.status_code in RETRYABLE_STATUS_CODES:
                     logger.warning(f"Non-streaming attempt {attempt} received upstream status {resp.status_code}")
                     if attempt == 0:
                         await wait_retry_delay()
@@ -385,7 +445,7 @@ async def chat_completions(request: Request, x_bridge_secret: Optional[str] = He
 
     finally:
         if slot_held_by_route:
-            await tracker.release(user_id)
+            await lease.release()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

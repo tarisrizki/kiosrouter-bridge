@@ -28,7 +28,7 @@ def test_endpoints_metadata():
             assert data["status"] == "online"
             assert data["service"] == "kiosan-bridge"
             assert data["concurrency_limit_per_user"] == 4
-            assert data["version"] == "3.1.0"
+            assert data["version"] == "3.2.0"
 
             res = await client.get("/health")
             assert res.status_code == 200
@@ -437,3 +437,130 @@ def test_model_normalization_and_headers():
     assert normalize_model("oc/glm-5.3-flash") == "oc/glm-5.3-flash-free"
     assert normalize_model("oc/mimo-v2.6-flash-free") == "oc/mimo-v2.6-flash-free"
     assert normalize_model("nemotron-3.5-super-vl-free") == "oc/nemotron-3.5-super-vl-free"
+
+def test_real_httpx_streaming_disguised_error_no_stream_consumed():
+    # Verify that real httpx response does not raise StreamConsumed on disguised error peek
+    async def _test():
+        async def fake_upstream(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/event-stream")]})
+            await send({"type": "http.response.body", "body": b'{"error":{"type":"FreeUsageLimitError","message":"limit reached"}}', "more_body": False})
+
+        upstream_transport = httpx.ASGITransport(app=fake_upstream)
+        real_client = httpx.AsyncClient(transport=upstream_transport)
+        with patch.object(app_module, "http_client", real_client):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                res = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "deepseek-v4.1-flash", "messages": [], "stream": True},
+                    headers={"x-user-key": "real-httpx-user"}
+                )
+                assert res.status_code == 429
+                data = res.json()
+                assert data["error"]["type"] == "FreeUsageLimitError"
+                assert await tracker.total_active() == 0
+    asyncio.run(_test())
+
+def test_client_abrupt_disconnect_releases_concurrency_immediately():
+    # Verify that client disconnect mid-stream releases tracker slot immediately without waiting for GC
+    async def _test():
+        async def fake_upstream(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/event-stream")]})
+            await send({"type": "http.response.body", "body": b"data: 1\n\n", "more_body": True})
+            await asyncio.sleep(2.0)
+            await send({"type": "http.response.body", "body": b"data: 2\n\n", "more_body": False})
+
+        upstream_transport = httpx.ASGITransport(app=fake_upstream)
+        real_client = httpx.AsyncClient(transport=upstream_transport)
+        with patch.object(app_module, "http_client", real_client):
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/chat/completions",
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"x-user-key", b"disconnect-user")
+                ]
+            }
+            body_sent = False
+            async def receive():
+                nonlocal body_sent
+                if not body_sent:
+                    body_sent = True
+                    return {
+                        "type": "http.request",
+                        "body": json.dumps({"model": "test", "messages": [], "stream": True}).encode("utf-8"),
+                        "more_body": False
+                    }
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if message["type"] == "http.response.body" and message.get("body"):
+                    # Abruptly simulate client disconnecting on first received body chunk
+                    raise OSError("Client socket forcibly closed")
+
+            try:
+                await app(scope, receive, send)
+            except (OSError, Exception):
+                pass
+
+            # Slot must be released immediately!
+            assert await tracker.user_active("disconnect-user") == 0
+            assert await tracker.total_active() == 0
+    asyncio.run(_test())
+
+def test_slot_lease_idempotency():
+    async def _test():
+        key = "lease-test-key"
+        await tracker.acquire(key)
+        assert await tracker.user_active(key) == 1
+        lease = app_module.SlotLease(tracker, key)
+        await lease.release()
+        assert await tracker.user_active(key) == 0
+        # Second call must be a no-op, cannot underflow
+        await lease.release()
+        assert await tracker.user_active(key) == 0
+        assert await tracker.total_active() == 0
+    asyncio.run(_test())
+
+def test_user_identifier_x_forwarded_for():
+    scope = {
+        "type": "http",
+        "headers": [
+            (b"x-forwarded-for", b"203.0.113.195, 10.0.0.1"),
+        ],
+        "client": ("10.0.0.1", 12345)
+    }
+    req = httpx.Request("POST", "http://test", headers={"x-forwarded-for": "203.0.113.195, 10.0.0.1"})
+    from fastapi import Request
+    # Wrap in starlette Request
+    async def empty_receive():
+        return {"type": "http.request"}
+    request = Request(scope, receive=empty_receive)
+    assert get_user_identifier(request) == "203.0.113.195"
+
+def test_transparent_retry_520_cloudflare_error():
+    async def _test():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            call_count = 0
+
+            async def mock_post(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return httpx.Response(520, content=b"Cloudflare Web Server Unknown Error")
+                return httpx.Response(200, json={"choices": [{"message": {"content": "Recovered from 520"}}]})
+
+            with patch.object(app_module.http_client, "post", side_effect=mock_post):
+                res = await client.post(
+                    "/v1/chat/completions",
+                    json={"model": "deepseek-v4.1-flash", "messages": []},
+                    headers={"x-user-key": "retry-user-520"}
+                )
+                assert res.status_code == 200
+                assert call_count == 2
+                assert res.json()["choices"][0]["message"]["content"] == "Recovered from 520"
+                assert await tracker.total_active() == 0
+    asyncio.run(_test())
+
