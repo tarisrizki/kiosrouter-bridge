@@ -18,7 +18,6 @@ import uvicorn
 TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "https://bridge.kiosan.my.id/v1/chat/completions")
 INTERNAL_KEY = os.environ.get("INTERNAL_KEY", "sk-c19dd0561af14824929e649640cce72d")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
-SILICONFLOW_KEY = os.environ.get("SILICONFLOW_KEY", "")
 CONCURRENCY_LIMIT = int(os.environ.get("CONCURRENCY_LIMIT", "4"))
 RETRY_DELAY_MIN = float(os.environ.get("RETRY_DELAY_MIN", "1.5"))
 RETRY_DELAY_MAX = float(os.environ.get("RETRY_DELAY_MAX", "2.0"))
@@ -196,7 +195,7 @@ async def diag():
     return {
         "active_concurrency": active_map,
         "target_url": TARGET_9ROUTER_URL,
-        "has_siliconflow_fallback": bool(SILICONFLOW_KEY)
+        "mode": "100%-pure-opencode-free"
     }
 
 @app.get("/v1/models")
