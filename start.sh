@@ -1,52 +1,63 @@
 #!/usr/bin/env bash
 set -e
 
-chmod +x ./bin/sing-box ./bin/9router-go 2>/dev/null || true
+chmod +x ./bin/9router-go 2>/dev/null || true
 
 echo "=========================================================="
-echo "🚀 [KiosanBridge] Starting 12-IP Userspace WARP Cloud Bridge"
+echo "🚀 [KiosanBridge] Starting Mnet Live Quota AI Cloud Bridge"
 echo "=========================================================="
 
-# 1. Register 12 Cloudflare WARP Accounts & Generate sing-box config
-echo "📡 [KiosanBridge] Generating 12 parallel WARP accounts..."
-python3 scripts/gen_warp.py
-
-# 2. Launch sing-box userspace gVisor netstack
-echo "⚡ [KiosanBridge] Starting sing-box WireGuard netstack..."
-./bin/sing-box run -c config.json > singbox.log 2>&1 &
-SB_PID=$!
-sleep 2
-
-# 3. Launch SOCKS5 round-robin balancer on :40000
-echo "🔄 [KiosanBridge] Starting SOCKS5 round-robin balancer on :40000..."
-python3 balancer.py > balancer.log 2>&1 &
-BAL_PID=$!
-sleep 1
-
-# Reset stale locks in sqlite3
+# 1. Reset stale locks in sqlite3 and ensure probe connection exists
 python3 -c "
 import sqlite3, json
 try:
     con = sqlite3.connect('data/data.sqlite3')
     cur = con.cursor()
+    
+    # Reset main connection
     row = cur.execute('SELECT data FROM providerConnections WHERE id=\"7931c4bc-e3cb-42d5-b244-2acc79a195bd\"').fetchone()
     if row:
-        data = json.loads(row[0])
-        data['rateLimitedUntil'] = None
-        data['lastError'] = None
-        data['status'] = 'active'
-        data['backoffLevel'] = 0
-        for k in list(data.keys()):
+        d = json.loads(row[0])
+        d['rateLimitedUntil'] = None
+        d['lastError'] = None
+        d['status'] = 'active'
+        d['backoffLevel'] = 0
+        for k in list(d.keys()):
             if k.startswith('modelLock_'):
-                data[k] = None
-        cur.execute('UPDATE providerConnections SET data = ? WHERE id=\"7931c4bc-e3cb-42d5-b244-2acc79a195bd\"', (json.dumps(data),))
-        cur.execute('UPDATE proxyPools SET data = ? WHERE id=\"warp-socks5\"', (json.dumps({'name':'WARP SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'}),))
-        con.commit()
+                d[k] = None
+        cur.execute('UPDATE providerConnections SET data = ?, priority = 100, isActive = 1 WHERE id=\"7931c4bc-e3cb-42d5-b244-2acc79a195bd\"', (json.dumps(d),))
+    
+    # Ensure probe connection exists on :40099
+    probe_row = cur.execute('SELECT id FROM providerConnections WHERE id = \"probe-opencode\"').fetchone()
+    probe_d = {
+        'backoffLevel': 0,
+        'rateLimitedUntil': None,
+        'status': 'active',
+        'connectionProxyEnabled': True,
+        'connectionProxyUrl': 'socks5://127.0.0.1:40099',
+        'proxyPoolId': 'probe-socks5'
+    }
+    if not probe_row:
+        cur.execute('''
+            INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ''', ('probe-opencode', 'opencode', 'apikey', 'OpenCode Probe', 1, 1, json.dumps(probe_d)))
+    else:
+        cur.execute('UPDATE providerConnections SET data = ?, priority = 1, isActive = 1 WHERE id = \"probe-opencode\"', (json.dumps(probe_d),))
+    
+    # Set proxy pools
+    cur.execute('INSERT OR REPLACE INTO proxyPools (id, isActive, testStatus, data, createdAt, updatedAt) VALUES (?, ?, ?, ?, datetime(\"now\"), datetime(\"now\"))',
+                ('warp-socks5', 1, 'active', json.dumps({'name':'Main SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'})))
+    cur.execute('INSERT OR REPLACE INTO proxyPools (id, isActive, testStatus, data, createdAt, updatedAt) VALUES (?, ?, ?, ?, datetime(\"now\"), datetime(\"now\"))',
+                ('probe-socks5', 1, 'active', json.dumps({'name':'Probe SOCKS5','proxyUrl':'socks5://127.0.0.1:40099'})))
+    con.commit()
+    con.close()
+    print('SQLite initialized successfully!')
 except Exception as e:
-    print('Reset warning:', e)
+    print('DB init warning:', e)
 "
 
-# 4. Launch 9router-go AI gateway on :20130
+# 2. Launch 9router-go AI gateway on :20130
 echo "🛡️ [KiosanBridge] Starting 9router-go gateway on :20130..."
 DATA_DIR="./data" \
 DB_PATH="./data/data.sqlite3" \
@@ -59,11 +70,11 @@ CAVEMAN_ENABLED=false \
 R_PID=$!
 sleep 2
 
-# 5. Health verification of local 9router
+# 3. Health verification of local 9router
 echo "🩺 [KiosanBridge] Verifying internal pipeline..."
 curl -s http://127.0.0.1:20130/models > /dev/null && echo "✅ 9router-go is online!" || echo "⚠️ 9router-go warmup pending"
 
-# 6. Launch FastAPI on public $PORT
+# 4. Launch FastAPI on public $PORT (which auto-boots Balancer and Harvester)
 TARGET_PORT="${PORT:-8000}"
 echo "🌟 [KiosanBridge] Launching FastAPI ingress on port $TARGET_PORT..."
 exec python3 -m uvicorn app:app --host 0.0.0.0 --port "$TARGET_PORT"

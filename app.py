@@ -7,6 +7,9 @@ from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 
+import balancer
+import harvester
+
 app = FastAPI(title="KiosanRouter Egress Bridge")
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "")
 TARGET_9ROUTER_URL = os.environ.get("TARGET_9ROUTER_URL", "http://127.0.0.1:20130/v1/chat/completions")
@@ -45,8 +48,8 @@ def reset_9router_locks():
                     d[k] = None
                     needs_update = True
             if needs_update:
-                cur.execute('UPDATE providerConnections SET data = ? WHERE id="7931c4bc-e3cb-42d5-b244-2acc79a195bd"', (json.dumps(d),))
-                cur.execute('UPDATE proxyPools SET data = ? WHERE id="warp-socks5"', (json.dumps({'name':'WARP SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'}),))
+                cur.execute('UPDATE providerConnections SET data = ?, priority = 100, isActive = 1 WHERE id="7931c4bc-e3cb-42d5-b244-2acc79a195bd"', (json.dumps(d),))
+                cur.execute('UPDATE proxyPools SET data = ? WHERE id="warp-socks5"', (json.dumps({'name':'Main SOCKS5','proxyUrl':'socks5://127.0.0.1:40000'}),))
                 con.commit()
         con.close()
     except Exception:
@@ -66,6 +69,8 @@ http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
 @app.on_event("startup")
 async def startup_event():
     reset_9router_locks()
+    await balancer.start_balancer()
+    asyncio.create_task(harvester.harvester_daemon(active_concurrency_getter=lambda: sum(ACTIVE_CONCURRENCY.values())))
     asyncio.create_task(periodic_lock_cleaner())
 
 @app.on_event("shutdown")
@@ -77,49 +82,25 @@ def index():
     return {
         "status": "online",
         "service": "kiosan-bridge",
-        "pool": "12-warp-nodes",
-        "version": "2.0.0"
+        "pool": "mnet-quota-verified-pool",
+        "active_proxies": len(balancer.ACTIVE_PROXIES),
+        "version": "3.0.0"
     }
 
 @app.get("/health")
 def health():
     return {
         "status": "healthy",
+        "active_proxies": len(balancer.ACTIVE_PROXIES),
         "timestamp": "ok"
     }
 
 @app.get("/diag")
 async def diag():
-    import subprocess
-    def tail_file(fpath):
-        try:
-            with open(fpath) as f:
-                return f.readlines()[-40:]
-        except Exception as e:
-            return [str(e)]
-
-    port_ips = {}
-    for p in range(40001, 40013):
-        try:
-            proc4 = subprocess.run(
-                ["curl", "-m", "2", "-s", "-4", "--socks5", f"127.0.0.1:{p}", "https://cloudflare.com/cdn-cgi/trace"],
-                capture_output=True, text=True, timeout=3
-            )
-            ip4 = [l for l in proc4.stdout.splitlines() if l.startswith("ip=")]
-            proc6 = subprocess.run(
-                ["curl", "-m", "2", "-s", "-6", "--socks5", f"127.0.0.1:{p}", "https://cloudflare.com/cdn-cgi/trace"],
-                capture_output=True, text=True, timeout=3
-            )
-            ip6 = [l for l in proc6.stdout.splitlines() if l.startswith("ip=")]
-            port_ips[p] = {"ipv4": ip4[0] if ip4 else "none", "ipv6": ip6[0] if ip6 else "none"}
-        except Exception as e:
-            port_ips[p] = str(e)
-
     return {
-        "port_ips": port_ips,
+        "pool_status": balancer.get_pool_status(),
         "active_concurrency": ACTIVE_CONCURRENCY,
-        "balancer_log": tail_file("balancer.log"),
-        "router_log": tail_file("9router.log")
+        "is_scanning": harvester.is_scanning
     }
 
 def make_fresh_session() -> str:
@@ -194,57 +175,67 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
         "x-claude-code-session-id": incoming_session
     }
 
-    # 4. Dispatch to local 9router-go (which uses sing-box 12-WARP pool)
+    # 4. Dispatch to local 9router-go (which uses balancer rotating pool)
     if is_stream:
         try:
-            req_obj = http_client.build_request("POST", TARGET_9ROUTER_URL, json=body, headers=forward_headers, timeout=120.0)
-            resp = await http_client.send(req_obj, stream=True)
-            if resp.status_code != 200:
-                err_body = await resp.aread()
-                await resp.aclose()
-                ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                    ACTIVE_CONCURRENCY.pop(user_id, None)
-                if resp.status_code == 429:
-                    reset_9router_locks()
-                return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
-
-            aiter = resp.aiter_bytes()
-            try:
-                first_chunk = await anext(aiter)
-            except StopAsyncIteration:
-                await resp.aclose()
-                ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                    ACTIVE_CONCURRENCY.pop(user_id, None)
-                return Response(content=b'{"error":{"message":"empty stream","type":"server_error"}}', status_code=502, media_type="application/json")
-
-            if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk:
-                rest = await resp.aread()
-                await resp.aclose()
-                ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
-                if ACTIVE_CONCURRENCY.get(user_id) == 0:
-                    ACTIVE_CONCURRENCY.pop(user_id, None)
-                reset_9router_locks()
-                return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
-
-            async def stream_generator():
-                try:
-                    yield first_chunk
-                    async for chunk in aiter:
-                        if chunk:
-                            yield chunk
-                finally:
+            # Attempt with 1 automatic retry on 429
+            for attempt in range(2):
+                req_obj = http_client.build_request("POST", TARGET_9ROUTER_URL, json=body, headers=forward_headers, timeout=120.0)
+                resp = await http_client.send(req_obj, stream=True)
+                if resp.status_code != 200:
+                    err_body = await resp.aread()
                     await resp.aclose()
+                    if resp.status_code == 429:
+                        reset_9router_locks()
+                        if attempt == 0:
+                            await asyncio.sleep(0.5)
+                            continue
                     ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
                     if ACTIVE_CONCURRENCY.get(user_id) == 0:
                         ACTIVE_CONCURRENCY.pop(user_id, None)
+                    return Response(content=err_body, status_code=resp.status_code, media_type="application/json")
 
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream",
-                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
-            )
+                aiter = resp.aiter_bytes()
+                try:
+                    first_chunk = await anext(aiter)
+                except StopAsyncIteration:
+                    await resp.aclose()
+                    if attempt == 0:
+                        continue
+                    ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                    if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                        ACTIVE_CONCURRENCY.pop(user_id, None)
+                    return Response(content=b'{"error":{"message":"empty stream","type":"server_error"}}', status_code=502, media_type="application/json")
+
+                if b"FreeTierError" in first_chunk or b"FreeUsageLimitError" in first_chunk:
+                    rest = await resp.aread()
+                    await resp.aclose()
+                    reset_9router_locks()
+                    if attempt == 0:
+                        await asyncio.sleep(0.5)
+                        continue
+                    ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                    if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                        ACTIVE_CONCURRENCY.pop(user_id, None)
+                    return Response(content=first_chunk + rest, status_code=429, media_type="application/json")
+
+                async def stream_generator():
+                    try:
+                        yield first_chunk
+                        async for chunk in aiter:
+                            if chunk:
+                                yield chunk
+                    finally:
+                        await resp.aclose()
+                        ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
+                        if ACTIVE_CONCURRENCY.get(user_id) == 0:
+                            ACTIVE_CONCURRENCY.pop(user_id, None)
+
+                return StreamingResponse(
+                    stream_generator(),
+                    media_type="text/event-stream",
+                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
+                )
         except Exception as e:
             ACTIVE_CONCURRENCY[user_id] = max(0, ACTIVE_CONCURRENCY.get(user_id, 1) - 1)
             if ACTIVE_CONCURRENCY.get(user_id) == 0:
@@ -267,6 +258,7 @@ async def chat_completions(request: Request, x_bridge_secret: str = Header(None)
                     if resp.status_code == 429:
                         reset_9router_locks()
                         if attempt == 0:
+                            await asyncio.sleep(0.5)
                             continue
                     
                     # Format usage for Strix AI / Pydantic compatibility
