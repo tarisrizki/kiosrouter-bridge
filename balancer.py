@@ -124,9 +124,9 @@ async def handle_probe_client(client_r: asyncio.StreamReader, client_w: asyncio.
 async def start_balancer():
     load_saved_proxies()
     logger.info(f"🚀 [Balancer] Starting Production SOCKS5 Balancer on {LISTEN_HOST}:{PROD_PORT}")
-    prod_server = await asyncio.start_server(handle_prod_client, LISTEN_HOST, PROD_PORT)
+    prod_server = await asyncio.start_server(handle_prod_client, LISTEN_HOST, PROD_PORT, reuse_address=True)
     logger.info(f"🔬 [Balancer] Starting Probe SOCKS5 Slot on {LISTEN_HOST}:{PROBE_PORT}")
-    probe_server = await asyncio.start_server(handle_probe_client, LISTEN_HOST, PROBE_PORT)
+    probe_server = await asyncio.start_server(handle_probe_client, LISTEN_HOST, PROBE_PORT, reuse_address=True)
     return prod_server, probe_server
 
 if __name__ == "__main__":

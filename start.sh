@@ -74,7 +74,8 @@ sleep 2
 echo "🩺 [KiosanBridge] Verifying internal pipeline..."
 curl -s http://127.0.0.1:20130/models > /dev/null && echo "✅ 9router-go is online!" || echo "⚠️ 9router-go warmup pending"
 
-# 4. Launch FastAPI on public $PORT (which auto-boots Balancer and Harvester)
+# 4. Launch FastAPI on public $PORT (Single worker to prevent port collision on 40000)
 TARGET_PORT="${PORT:-8000}"
-echo "🌟 [KiosanBridge] Launching FastAPI ingress on port $TARGET_PORT..."
-exec python3 -m uvicorn app:app --host 0.0.0.0 --port "$TARGET_PORT"
+export WEB_CONCURRENCY=1
+echo "🌟 [KiosanBridge] Launching FastAPI ingress on port $TARGET_PORT (1 worker)..."
+exec python3 -m uvicorn app:app --host 0.0.0.0 --port "$TARGET_PORT" --workers 1
